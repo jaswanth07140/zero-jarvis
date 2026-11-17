@@ -1,0 +1,12 @@
+[Unit]
+Description=Zero/Jarvis self-healing guard (restores wiped files, keeps the engine up)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=jaswanth072012
+Group=jaswanth072012
+Environment=HOME=/home/jaswanth072012
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/bin/bash /usr/local/share/zero-jarvis/canonical/restore.sh --quiet
+TimeoutStartSec=120

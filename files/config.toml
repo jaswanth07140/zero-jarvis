@@ -1,0 +1,39 @@
+# OpenJarvis configuration — engine: ZERO
+#
+# The engine is the Zero brain (~/zero-ai): persona + hard rules + knowledge/
+# facts, served by ~/zero-ai/runtime/zero_engine.py on 127.0.0.1:8642.
+# No Ollama, no llama.cpp, no vLLM, no model weights, no cloud provider.
+
+[engine]
+default = "zero"
+
+[engine.zero]
+host = "http://127.0.0.1:8642"
+
+[intelligence]
+default_model = "zero"
+fallback_model = "zero"
+temperature = 0.0
+max_tokens = 2048
+
+[agent]
+default_agent = "jarvis"
+max_turns = 10
+context_from_memory = true
+
+[tools]
+enabled = ["web_search", "file_read", "shell_exec"]
+
+# Local memory: facts (JSONL, pure-Python LocalFactStore) + context injection.
+[tools.storage]
+default_backend = "sqlite"
+db_path = "~/.openjarvis/memory.db"
+enabled = true
+backend = "local"
+max_facts = 1000
+facts_path = "~/.openjarvis/memory_facts.jsonl"
+context_top_k = 5
+context_min_score = 0.1
+context_max_tokens = 2048
+chunk_size = 512
+chunk_overlap = 64

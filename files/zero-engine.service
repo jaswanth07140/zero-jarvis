@@ -1,0 +1,16 @@
+[Unit]
+Description=Zero engine — brain-backed OpenAI-compatible endpoint (zero-ai knowledge base)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jaswanth072012/zero-ai
+ExecStart=/usr/bin/python3 /home/jaswanth072012/zero-ai/runtime/zero_engine.py --host 127.0.0.1 --port 8642
+Restart=always
+RestartSec=2
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

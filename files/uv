@@ -1,0 +1,36 @@
+#!/bin/bash
+# uv shim — routes the OpenJarvis desktop app to the Zero-backed install.
+#
+# The packaged app calls `uv sync --extra desktop --group desktop-native`
+# (needs cargo + a native build) and `uv run python -c "import openjarvis_rust"`.
+# This install runs Zero as the engine, which needs neither:
+#   * sync                -> nothing to do, the venv is already provisioned
+#   * import openjarvis_rust -> report success
+#   * run jarvis ...      -> the real CLI from the provisioned venv
+#   * run python ...      -> the provisioned venv interpreter
+#   * anything else       -> the real uv binary
+REAL="$HOME/.local/bin/uv.real"
+echo "$(date -Is) cwd=$PWD args=$*" >> /tmp/opencode/uv-shim.log
+VENV="$HOME/.openjarvis-venv"
+
+if [ "$1" = "sync" ]; then
+  exit 0
+fi
+
+if [ "$1" = "run" ]; then
+  shift
+  if [ "$1" = "python" ]; then
+    case "$*" in
+      *openjarvis_rust*) exit 0 ;;
+    esac
+    shift
+    exec "$VENV/bin/python" "$@"
+  fi
+  if [ "$1" = "jarvis" ]; then
+    shift
+    exec "$VENV/bin/jarvis" "$@"
+  fi
+  exec "$REAL" run "$@"
+fi
+
+exec "$REAL" "$@"

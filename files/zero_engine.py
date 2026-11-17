@@ -33,6 +33,7 @@ import re
 import sys
 import time
 import threading
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -42,6 +43,29 @@ MEMORY_FACTS = pathlib.Path.home() / ".openjarvis" / "memory_facts.jsonl"
 
 MODEL_ID = "zero"
 VERSION = "1.0"
+
+# ---------------------------------------------------------------- delegation
+#
+# Zero answers from the brain first. Anything the brain does not hold is
+# delegated to the free model router (freellmapi) so the assistant can answer
+# general questions. Zero stays the engine and the identity; the router is
+# only consulted for questions Zero would otherwise have to refuse.
+#
+# Disable with ZERO_ESCALATE=0 to get the original retrieval-only behaviour.
+ESCALATE = os.environ.get("ZERO_ESCALATE", "1").lower() not in ("0", "false", "no", "off")
+ESCALATE_URL = os.environ.get("ZERO_ESCALATE_URL", "http://127.0.0.1:3001/v1")
+ESCALATE_MODEL = os.environ.get("ZERO_ESCALATE_MODEL", "auto")
+ESCALATE_KEY_FILE = pathlib.Path(
+    os.environ.get(
+        "ZERO_ESCALATE_KEY_FILE",
+        str(pathlib.Path.home() / ".config/opencode/freellmapi.key"),
+    )
+)
+ESCALATE_TIMEOUT = float(os.environ.get("ZERO_ESCALATE_TIMEOUT", "90"))
+
+# "model"    — generative assistant with Zero's persona, answers anything
+# "grounded" — original behaviour: brain first, refuse what is not recorded
+MODE = os.environ.get("ZERO_MODE", "model").strip().lower()
 
 # ---------------------------------------------------------------- brain import
 
@@ -287,21 +311,122 @@ def _coverage_gap(query: str, hits: list[Entry]) -> list[str]:
 
 
 def _identity_answer() -> str:
+    delegated = (
+        "Anything the brain does not hold is delegated to the free model router, "
+        "and I say which one answered."
+        if ESCALATE
+        else "I answer only from the brain and refuse anything not recorded."
+    )
     return (
         f"I am {MODEL_ID} — this repo's brain, answering directly. "
         f"{len(INDEX.entries)} facts across {len(INDEX.domains)} domains "
         f"({ROOT}/knowledge), plus persona and hard rules from {ROOT}/identity.\n\n"
-        "Retrieval is exact, not generative: I return what is recorded and say so when "
-        "something is not. No model weights, no Ollama, no external API."
+        f"Facts about this machine come from recorded sources, not guesses. {delegated} "
+        "No model weights, no Ollama, no local inference."
     )
 
 
-def answer(query: str) -> str:
-    """Compose a grounded answer from the brain. Never invents."""
+def _persona_prompt() -> str:
+    """Zero's voice: persona + hard rules, with HTML comments stripped."""
+    parts: list[str] = []
+    for name in ("persona.md", "rules.md"):
+        path = ROOT / "identity" / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        text = re.sub(r"<!--.*?-->", "", text, flags=re.S).strip()
+        if text:
+            parts.append(text)
+    if not parts:
+        parts.append("You are Zero, a direct technical assistant. Be concise and correct.")
+    parts.append(
+        "Your name is Zero. You are speaking to the operator through the OpenJarvis "
+        "desktop app on their own machine. Answer directly; do not mention which "
+        "upstream model served the request unless asked."
+    )
+    try:
+        facts = [e.text for e in INDEX.entries]
+    except NameError:
+        facts = []
+    if facts:
+        digest = "\n".join(f"- {f}" for f in facts[:90])
+        parts.append(
+            "What you know about this machine (from the operator's own notes — prefer "
+            "these over assumptions, and say so if a detail is missing):\n" + digest[:6000]
+        )
+    return "\n\n".join(parts)[:12000]
+
+
+_PERSONA_CACHE: str | None = None
+
+
+def _persona() -> str:
+    global _PERSONA_CACHE
+    if _PERSONA_CACHE is None:
+        _PERSONA_CACHE = _persona_prompt()
+    return _PERSONA_CACHE
+
+
+def _apply_persona(messages: list[dict]) -> list[dict]:
+    """Prepend Zero's system prompt without dropping the caller's own."""
+    prompt = _persona()
+    if messages and (messages[0].get("role") or "") == "system":
+        merged = {**messages[0], "content": prompt + "\n\n" + (messages[0].get("content") or "")}
+        return [merged, *messages[1:]]
+    return [{"role": "system", "content": prompt}, *messages]
+
+
+def _upstream_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    try:
+        key = ESCALATE_KEY_FILE.read_text(encoding="utf-8").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+    except OSError:
+        pass
+    return headers
+
+
+_ESCALATE_FIELDS = (
+    "messages", "tools", "tool_choice", "temperature", "max_tokens", "top_p",
+    "stop", "presence_penalty", "frequency_penalty", "response_format",
+)
+
+
+def escalate(body: dict) -> dict | None:
+    """Ask the free router for a general answer. Returns an OpenAI dict or None.
+
+    Only consulted when the brain has nothing recorded. A router outage must
+    never break the engine, so every failure path returns None.
+    """
+    if not ESCALATE:
+        return None
+    payload = {k: body[k] for k in _ESCALATE_FIELDS if k in body}
+    payload["model"] = ESCALATE_MODEL
+    payload["stream"] = False
+    try:
+        req = urllib.request.Request(
+            ESCALATE_URL.rstrip("/") + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=_upstream_headers(),
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=ESCALATE_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - never let delegation break the engine
+        return None
+    if not data.get("choices"):
+        return None
+    return data
+
+
+def lookup_answer(query: str) -> str | None:
+    """Answer from the brain. Returns None when nothing relevant is recorded."""
     INDEX.refresh()
     text = (query or "").strip()
     if not text:
-        return "Ask me something and I will answer from the brain."
+        return None
 
     n = norm(text)
     if n in GREETINGS:
@@ -318,18 +443,7 @@ def answer(query: str) -> str:
 
     hits = INDEX.search(text, limit=5)
     if not hits:
-        near = INDEX.near_domains(text)
-        lines = ["That is not recorded, so I will not guess."]
-        if near:
-            lines.append("")
-            lines.append("Closest domains I hold: " + ", ".join(near) + ".")
-        else:
-            sample = ", ".join(sorted(INDEX.domains)[:8])
-            lines.append("")
-            lines.append(f"Domains I hold include: {sample}, and {max(0, len(INDEX.domains) - 8)} more.")
-        lines.append("")
-        lines.append(f"Nothing in the brain matches: {', '.join(sorted(brain.terms(text))) or text}.")
-        return "\n".join(lines)
+        return None
 
     out = [f"{hits[0].text} — {hits[0].file}"]
     if len(hits) > 1:
@@ -341,8 +455,44 @@ def answer(query: str) -> str:
     gap = _coverage_gap(text, hits)
     if gap:
         out.append("")
-        out.append("Not recorded: " + ", ".join(gap) + ".")
+        out.append("Recorded, but not covered: " + ", ".join(gap) + ".")
     return "\n".join(out)
+
+
+def miss_text(query: str) -> str:
+    near = INDEX.near_domains(query)
+    lines = ["That is not in the brain, and the free model router is not reachable."]
+    if near:
+        lines.append("")
+        lines.append("Closest domains I hold: " + ", ".join(near) + ".")
+    lines.append("")
+    lines.append(f"Nothing in the brain matches: {', '.join(sorted(brain.terms(query))) or query}.")
+    return "\n".join(lines)
+
+
+def answer(query: str) -> str:
+    """Model mode answers freely; grounded mode is brain first with a refusal."""
+    text = (query or "").strip()
+    if not text:
+        return "Ask me something and I will answer."
+
+    if MODE == "model":
+        esc = escalate({"messages": _apply_persona([{"role": "user", "content": text}])})
+        if esc:
+            content = ((esc["choices"][0].get("message") or {}).get("content") or "").strip()
+            if content:
+                return content
+
+    local = lookup_answer(text)
+    if local is not None:
+        return local
+
+    esc = escalate({"messages": _apply_persona([{"role": "user", "content": text}])})
+    if esc:
+        content = ((esc["choices"][0].get("message") or {}).get("content") or "").strip()
+        if content:
+            return content
+    return miss_text(text)
 
 
 def _last_user_message(messages: list[dict]) -> str:
@@ -464,11 +614,42 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self, body: dict) -> None:
         messages = body.get("messages") or []
         query = _last_user_message(messages)
-        text = answer(query)
+        tool_calls = None
+
+        text = None
+        tool_calls = None
+
+        # Model mode: Zero's persona speaks first, no retrieval gate.
+        if MODE == "model":
+            esc = escalate({**body, "messages": _apply_persona(messages)})
+            if esc:
+                message = esc["choices"][0].get("message") or {}
+                text = (message.get("content") or "").strip() or None
+                tool_calls = message.get("tool_calls") or None
+
+        # Grounded fallback (and the primary path in grounded mode).
+        if text is None and not tool_calls:
+            text = lookup_answer(query)
+
+        if text is None and not tool_calls:
+            esc = escalate({**body, "messages": _apply_persona(messages)})
+            if esc:
+                message = esc["choices"][0].get("message") or {}
+                text = (message.get("content") or "").strip() or None
+                tool_calls = message.get("tool_calls") or None
+
+        if text is None and not tool_calls:
+            text = miss_text(query)
+        if text is None:
+            text = ""
+
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
 
         if not body.get("stream"):
+            message: dict = {"role": "assistant", "content": text}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
             self._send_json(200, {
                 "id": cid,
                 "object": "chat.completion",
@@ -476,8 +657,8 @@ class Handler(BaseHTTPRequestHandler):
                 "model": MODEL_ID,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
                 }],
                 "usage": _usage(query, text),
             })
@@ -506,7 +687,10 @@ class Handler(BaseHTTPRequestHandler):
             step = 48
             for i in range(0, len(text), step):
                 emit({"content": text[i:i + step]})
-            emit({}, "stop")
+            if tool_calls:
+                emit({"tool_calls": tool_calls}, "tool_calls")
+            else:
+                emit({}, "stop")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):

@@ -38,6 +38,14 @@ if [ ! -f "$HOME/zero-ai/runtime/brain.py" ] \
   fi
 fi
 
+# --- 1b. checkout integrity -------------------------------------------------
+if [ -d "$HOME/openjarvis/.git" ] \
+   && { [ ! -f "$HOME/openjarvis/src/openjarvis/__init__.py" ] \
+        || [ ! -f "$HOME/openjarvis/pyproject.toml" ]; }; then
+  git -C "$HOME/openjarvis" restore . >>"$LOG" 2>&1 \
+    && { log "restored deleted files in ~/openjarvis"; note "restored ~/openjarvis checkout"; changed=1; }
+fi
+
 # --- 2. knowledge files (any removed domain file) -------------------------
 missing_knowledge=$(find "$HOME/zero-ai/knowledge" -name "*.md" 2>/dev/null | wc -l)
 if [ "$missing_knowledge" -lt 40 ] && [ -f "$CANON/zero-ai.tar.gz" ]; then

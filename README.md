@@ -34,9 +34,17 @@ zero engine (127.0.0.1:8642)
 
 ## Install / repair
 
+Clone (public, no token needed):
+
 ```bash
 git clone https://github.com/jaswanth07140/zero-jarvis.git ~/zero-jarvis
 bash ~/zero-jarvis/install.sh
+```
+
+Or repair from the copy already on this machine — no network at all:
+
+```bash
+bash /usr/local/share/zero-jarvis/canonical/repair.sh
 ```
 
 Run it again any time — after `curl -fsSL open-jarvis.github.io/OpenJarvis/install.sh | bash`,

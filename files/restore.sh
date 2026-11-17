@@ -61,6 +61,7 @@ done
 # --- 4. OpenJarvis customisations ----------------------------------------
 if [ ! -f "$HOME/openjarvis/src/openjarvis/engine/zero_brain.py" ] \
    || ! grep -q zero_brain "$HOME/openjarvis/src/openjarvis/engine/__init__.py" 2>/dev/null \
+   || ! grep -q "zero: only expose" "$HOME/openjarvis/src/openjarvis/server/routes.py" 2>/dev/null \
    || [ ! -f "$HOME/.openjarvis/inference.json" ] \
    || ! grep -q 'default = "zero"' "$HOME/.openjarvis/config.toml" 2>/dev/null; then
   bash "$CANON/install-customisations.sh" >>"$LOG" 2>&1 \
@@ -80,10 +81,20 @@ if [ ! -f "$HOME/.local/bin/uv" ] || ! grep -q "uv shim" "$HOME/.local/bin/uv" 2
 fi
 
 # --- 4c. project-root symlink the desktop app looks for ------------------
-if [ ! -e "$HOME/OpenJarvis/pyproject.toml" ]; then
-  ln -sfn "$HOME/openjarvis" "$HOME/OpenJarvis" 2>/dev/null
-  log "restored ~/OpenJarvis project-root symlink"
-  changed=1
+# A stock OpenJarvis install drops a real clone at ~/OpenJarvis and replaces
+# our link. Move that clone aside and point the path back at the Zero tree.
+if [ -f "$HOME/openjarvis/pyproject.toml" ]; then
+  if [ -e "$HOME/OpenJarvis" ] && [ ! -L "$HOME/OpenJarvis" ]; then
+    rm -rf "$HOME/.openjarvis-stock-backup" 2>/dev/null
+    mv "$HOME/OpenJarvis" "$HOME/.openjarvis-stock-backup" 2>/dev/null \
+      && log "moved stock ~/OpenJarvis clone to ~/.openjarvis-stock-backup"
+    changed=1
+  fi
+  if [ ! -L "$HOME/OpenJarvis" ] || [ "$(readlink -f "$HOME/OpenJarvis" 2>/dev/null)" != "$(readlink -f "$HOME/openjarvis" 2>/dev/null)" ]; then
+    ln -sfn "$HOME/openjarvis" "$HOME/OpenJarvis" 2>/dev/null
+    log "restored ~/OpenJarvis -> ~/openjarvis"
+    changed=1
+  fi
 fi
 
 # --- 5. systemd unit ------------------------------------------------------

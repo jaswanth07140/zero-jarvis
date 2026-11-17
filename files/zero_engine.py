@@ -22,8 +22,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
+import datetime
 import importlib.util
 import json
+import operator
 import os
 import pathlib
 import re
@@ -60,6 +63,92 @@ IDENTITY_CUES = (
 
 def norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower()).strip(" .!?")
+
+
+# ---------------------------------------------------------------- computed answers
+#
+# Arithmetic and clock questions are *computed*, not retrieved and not
+# generated — there is no model involved. They are labelled as computed so the
+# brain never pretends they came from knowledge/.
+
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_MAX_POW = 64
+_MAX_ABS = 10 ** 12
+
+
+def _safe_num(node):
+    """Evaluate a numeric AST without eval(); rejects everything else."""
+    if isinstance(node, ast.Expression):
+        return _safe_num(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        left = _safe_num(node.left)
+        right = _safe_num(node.right)
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > _MAX_POW or abs(left) > _MAX_ABS:
+                raise ValueError("expression too large")
+        value = _BINOPS[type(node.op)](left, right)
+        if isinstance(value, (int, float)) and abs(value) > _MAX_ABS:
+            raise ValueError("result too large")
+        return value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _safe_num(node.operand)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    raise ValueError("unsupported expression")
+
+
+_MATH_CHARS = re.compile(r"^[\s0-9.+\-*/%()^]+$")
+_MATH_LEAD = re.compile(
+    r"^(what\s+is|what's|whats|calculate|compute|how\s+much\s+is|solve)\s+", re.I
+)
+_CLOCK = re.compile(
+    r"\b(what\s+time|current\s+time|the\s+time|time\s+is\s+it|what\s+day|today'?s\s+date"
+    r"|what\s+is\s+the\s+date|what'?s\s+the\s+date|current\s+date)\b",
+    re.I,
+)
+
+
+def _format_number(value) -> str:
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{round(value, 10):g}"
+    return str(value)
+
+
+def _try_computed(text: str) -> str | None:
+    """Return an exact computed answer, or None to fall through to retrieval."""
+    if _CLOCK.search(text):
+        now = datetime.datetime.now()
+        return (
+            f"{now.strftime('%A, %d %B %Y')} — {now.strftime('%H:%M:%S')} "
+            f"(local time). Computed from the system clock, not retrieved from the brain."
+        )
+
+    expr = _MATH_LEAD.sub("", text.strip()).strip().rstrip("?= ").strip()
+    if not expr or not _MATH_CHARS.match(expr):
+        return None
+    if not re.search(r"\d", expr) or not re.search(r"[+\-*/%^]", expr):
+        return None
+    try:
+        value = _safe_num(ast.parse(expr.replace("^", "**"), mode="eval"))
+    except ZeroDivisionError:
+        return f"{expr} is undefined — division by zero.\n\nComputed exactly — no model, no lookup."
+    except Exception:  # noqa: BLE001 - any failure means "not a math question"
+        return None
+    return (
+        f"{expr} = {_format_number(value)}\n\n"
+        "Computed exactly — no model, no lookup."
+    )
 
 
 # ---------------------------------------------------------------- knowledge index
@@ -222,6 +311,10 @@ def answer(query: str) -> str:
         )
     if any(cue in n for cue in IDENTITY_CUES):
         return _identity_answer()
+
+    computed = _try_computed(text)
+    if computed is not None:
+        return computed
 
     hits = INDEX.search(text, limit=5)
     if not hits:
